@@ -1,0 +1,172 @@
+import pandas as pd
+import numpy as np
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+import time
+import glob
+import matplotlib.pyplot as plt
+
+# Function to parse XML file and extract relevant data
+def parse_xml(xml_file):
+    tree = ET.parse(xml_file)
+    root = tree.getroot()
+    
+    glucose_levels = []
+    basal_insulin = []
+    bolus_insulin = []
+    carbs = []
+
+    # Extract glucose levels
+    for glucose_event in root.findall(".//glucose_level/event"):
+        ts = glucose_event.get('ts')
+        value = float(glucose_event.get('value'))
+        glucose_levels.append((ts, value))
+
+    # Extract basal insulin
+    for basal_event in root.findall(".//basal/event"):
+        ts = basal_event.get('ts')
+        value = float(basal_event.get('value'))
+        basal_insulin.append((ts, value))
+
+    # Extract bolus insulin
+    for bolus_event in root.findall(".//bolus/event"):
+        ts = bolus_event.get('ts_begin')
+        dose = float(bolus_event.get('dose'))
+        bolus_insulin.append((ts, dose))
+
+    # Extract meal data
+    for meal_event in root.findall(".//meal/event"):
+        ts = meal_event.get('ts')
+        carbs_value = float(meal_event.get('carbs'))
+        carbs.append((ts, carbs_value))
+
+    # Combine all data into a DataFrame
+    data = []
+    for ts, glucose in glucose_levels:
+        basal = next((value for t, value in basal_insulin if t == ts), 0)
+        bolus = next((dose for t, dose in bolus_insulin if t == ts), 0)
+        meal = next((carbs_value for t, carbs_value in carbs if t == ts), 0)
+        data.append((ts, glucose, basal, bolus, meal))
+
+    df = pd.DataFrame(data, columns=['timestamp', 'glucose', 'basal_insulin', 'bolus_insulin', 'carbs'])
+    
+    # Specify the correct format for parsing the timestamp
+    df['timestamp'] = pd.to_datetime(df['timestamp'], format='%d-%m-%Y %H:%M:%S')
+    
+    return df
+
+# Load and preprocess the data from multiple files
+def load_data(file_paths):
+    data_frames = []
+    for file in file_paths:
+        try:
+            df = parse_xml(file)
+            data_frames.append(df)
+        except ET.ParseError as e:
+            print(f"Error parsing file {file}: {e}")
+    combined_df = pd.concat(data_frames, ignore_index=True)
+    return combined_df
+
+# Paths to training and testing XML files
+train_files = glob.glob('E:/SEM8/Datasets/Ohio T1DM/OhioT1DM/2020/train/*.xml')
+test_files = glob.glob('E:/SEM8/Datasets/Ohio T1DM/OhioT1DM/2020/test/*.xml')
+
+# Load data
+train_df = load_data(train_files)
+test_df = load_data(test_files)
+
+# Preprocess the data
+def preprocess_data(df, time_horizon):
+    # Sort the data by timestamp
+    df.sort_values(by='timestamp', inplace=True)
+
+    # Feature Engineering: Creating time-based features
+    df['minute_of_day'] = df['timestamp'].dt.hour * 60 + df['timestamp'].dt.minute
+
+    # Selecting features and target variable
+    features = ['minute_of_day', 'basal_insulin', 'bolus_insulin', 'carbs']
+    target = 'glucose'
+
+    X = df[features]
+    y = df[target].shift(-time_horizon)
+
+    # Drop the last rows that have NaN target values
+    X = X[:-time_horizon]
+    y = y[:-time_horizon]
+
+    # Standardize the features
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    # Reshape data for LSTM (samples, timesteps, features)
+    time_steps = 10  # Number of past observations to consider
+    X_lstm = []
+    y_lstm = []
+
+    for i in range(time_steps, len(X_scaled)):
+        X_lstm.append(X_scaled[i-time_steps:i, :])
+        y_lstm.append(y.iloc[i])
+
+    return np.array(X_lstm), np.array(y_lstm)
+
+# Define prediction horizons (in minutes)
+time_horizons = [30, 45, 60]
+
+# Iterate over each time horizon
+for time_horizon in time_horizons:
+    print(f"\nTraining for {time_horizon}-minute prediction horizon...\n")
+
+    # Preprocess the data
+    X_train, y_train = preprocess_data(train_df, time_horizon)
+    X_test, y_test = preprocess_data(test_df, time_horizon)
+
+    # Build the LSTM model
+    model = Sequential()
+    model.add(LSTM(units=200, return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])))
+    model.add(Dropout(0.3))
+    model.add(LSTM(units=200, return_sequences=False))
+    model.add(Dropout(0.3))
+    model.add(Dense(units=1))
+
+    # Compile the model
+    model.compile(optimizer=Adam(learning_rate=0.0005), loss='mean_squared_error')
+
+    # Train the model with early stopping
+    early_stopping = EarlyStopping(monitor='val_loss', patience=10)
+
+    # Measure training time
+    start_time = time.time()
+    history = model.fit(X_train, y_train, epochs=300, batch_size=32, validation_split=0.2, callbacks=[early_stopping])
+    training_time = time.time() - start_time
+
+    # Evaluate the model
+    loss = model.evaluate(X_test, y_test)
+    print(f'Test Loss: {loss}')
+
+    # Measure prediction time
+    start_time = time.time()
+    predictions = model.predict(X_test)
+    prediction_time = time.time() - start_time
+
+    # Calculate RMSE
+    rmse = np.sqrt(mean_squared_error(y_test, predictions))
+    print(f'RMSE: {rmse}')
+    print(f'Training Time: {training_time} seconds')
+    print(f'Prediction Time: {prediction_time} seconds')
+
+    # Plot the results
+    plt.figure(figsize=(10, 5))
+    plt.plot(y_test, label='Actual Glucose Levels')
+    plt.plot(predictions, label='Predicted Glucose Levels')
+    plt.legend()
+    plt.xlabel('Time')
+    plt.ylabel('Glucose Level')
+    plt.title(f'Blood Glucose Level Prediction ({time_horizon}-minute Horizon)')
+    plt.show()
